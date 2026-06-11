@@ -1,4 +1,6 @@
-# SentinelAI — Project Brief
+# SentinelAI — Project Brief & Engineering Journal
+
+---
 
 ## What it is
 
@@ -34,21 +36,451 @@ problem by being a platform with real production concerns:
 An interviewer can spend 20 minutes on the architecture alone.
 
 
-## Inspiration
+---
 
-Three open-source projects shaped the design. None were copied — their ideas were
-studied and then re-implemented from scratch in a unified backend.
+## Where the Ideas Came From
 
-| Source        | What was borrowed                                           | Why                                                         |
-|---------------|-------------------------------------------------------------|-------------------------------------------------------------|
-| Helicone      | Unified provider abstraction, routing, cost/usage tracking  | One gateway for many models instead of direct API sprawl    |
-| ArchGW        | Proxy-style prompt guardrails, resilient routing, tracing   | Treat AI traffic like network traffic needing a control plane |
-| OpenLLMetry   | OTel-style spans, metrics, trace-based debugging            | LLM systems need the same observability as any backend service |
+This project was not built by copying any single repo. It was designed by studying three
+real production open-source systems, extracting the idea behind each one, and combining
+them into one unified backend built from scratch. Each source solved a different problem.
 
-The interview framing: "I identified three production problems — provider sprawl, missing
-guardrails, and poor observability — then studied how the industry solves each one and
-built a unified backend platform around those patterns."
 
+### 1. Helicone / AI Gateway repos — unified model access + observability mindset
+
+**What it is:**
+Helicone is a proxy that sits in front of OpenAI (and other providers) and gives teams
+one endpoint for all LLM calls, with routing, fallbacks, cost tracking, and usage
+dashboards. Their product is described as "intelligent routing, automatic fallbacks, and
+observability across 100+ providers."
+
+**What we borrowed:**
+- The idea that a gateway owns all LLM traffic rather than apps calling providers directly
+- Provider abstraction: same API shape regardless of which model is behind it
+- Cost and token tracking at the gateway layer, not the application layer
+- Usage dashboards and per-tenant quotas
+
+**Why we borrowed it:**
+Without this idea, the project would just be a chatbot. With it, it becomes
+infrastructure. The gateway identity is what makes it a platform rather than an app.
+Every feature (auth, rate limits, routing, retries, semantic cache) only makes sense
+when there is a central control point for all traffic. That central point is the Helicone
+idea applied from scratch.
+
+**What we built differently:**
+We did not use their hosted service or copy their code. We built our own routing logic
+in `router.ts` with a `RouteDecision` type, a `COST_TABLE` for per-model pricing, and
+our own fallback logic. The `estimateCost()` function in `llm.ts` calculates spend per
+request and feeds the budget enforcement system, which Helicone does not have.
+
+
+### 2. ArchGW (katanemo/archgw) — AI-native proxy with guardrails + agent traffic control
+
+**What it is:**
+ArchGW is an AI-native proxy built on Envoy that treats LLM and agent traffic like
+network traffic. It is described as handling "prompt guardrails, intelligent routing,
+function/API calling, retries, resilience, and W3C trace context support." The core
+idea is: AI prompts should pass through a proxy layer that enforces policy, not get
+sent raw to providers.
+
+**What we borrowed:**
+- The proxy mindset: requests are inspected, filtered, and transformed before forwarding
+- Prompt injection detection and content policy enforcement as a first-class pipeline step
+- Resilient routing: retries with backoff, automatic fallback to alternate providers
+- Trace context attached to every request flowing through the system
+- The framing that guardrails belong in infrastructure, not in each application
+
+**Why we borrowed it:**
+ArchGW upgrades the project from "LLM middleware" to "AI control plane." Without this
+angle, the guardrails and security layer would feel like an afterthought. ArchGW's
+framing — that AI prompts deserve the same proxy-layer treatment as HTTP traffic —
+makes the security features feel architecturally necessary, which is the right answer
+in any system design interview.
+
+**What we built differently:**
+ArchGW is built on Rust and Envoy. We built our guardrails as a pure TypeScript service
+(`guardrails.ts`) running in-process in Fastify as a preHandler. We added PII redaction
+(phone numbers, emails, SSNs, credit cards) on top of injection detection, which
+ArchGW does not expose as a default feature. We also added an immutable audit log table
+that records every policy trigger, something ArchGW's proxy layer does not have.
+
+
+### 3. OpenLLMetry (traceloop/openllmetry) — OTel-based LLM observability
+
+**What it is:**
+OpenLLMetry instruments LLM calls, vector DB operations, and API calls with standard
+OpenTelemetry spans and exports them to Grafana, Datadog, or SigNoz. Their stated goal
+is: "Treat LLM systems like real production systems with proper telemetry."
+
+**What we borrowed:**
+- The idea that every LLM call should produce a structured span with start_time,
+  end_time, duration, status, and attributes, not just a log line
+- Spans form a tree: one trace_id links all spans for a single request (auth span,
+  routing span, retrieval span, LLM span)
+- The `name` field on spans uses dot notation (`gateway.guardrails`, `llm.completion`,
+  `retrieval.search`) — the same convention OpenTelemetry uses for instrumentation
+- Metrics should be Prometheus-compatible and cover token usage, cost, and latency
+  in addition to standard HTTP metrics
+
+**Why we borrowed it:**
+Without this, the observability story is just logs. With it, you can reconstruct exactly
+what happened for any request — which model was called, how long each step took, whether
+a guardrail fired, and what the eval scores came out to. That is debuggable production
+software, not a demo.
+
+**What we built differently:**
+We did not integrate the OpenLLMetry SDK. We built our own `tracer.ts` which manages
+span creation and a `flushSpans()` function that writes them to the `trace_spans` table
+in Postgres. We added a `GET /v1/traces/:traceId` endpoint to reconstruct a full request
+timeline from the DB. We also added Prometheus metrics via `prom-client` and a Grafana
+dashboard provisioned via Docker volume mounts, which OpenLLMetry handles through
+external exporters. Our approach keeps everything self-contained with no external
+observability dependency.
+
+
+### How the three ideas combine
+
+```
+Helicone idea:  one gateway owns all LLM traffic
+     +
+ArchGW idea:    traffic passes through a policy/guardrail/resilience layer
+     +
+OpenLLMetry:    every step emits structured telemetry
+     =
+SentinelAI:     a self-hosted AI control plane with routing, security,
+                retrieval, agents, and full observability in one deployable stack
+```
+
+The interview framing:
+"I identified three production problems in LLM systems — provider sprawl, missing
+guardrails, and poor observability. I studied the systems the industry built to solve
+each one, then designed a unified backend platform around those patterns and built
+everything from scratch."
+
+
+---
+
+## Design Decisions & Trade-offs
+
+### Why Fastify over Express
+Fastify has a built-in schema validation system using JSON Schema (and Zod via plugins),
+first-class TypeScript support, and a plugin architecture that makes auth, rate limiting,
+and Swagger registration clean. Express would have worked but required more boilerplate
+for the same result. Fastify also has lower overhead, which matters for a gateway that
+adds latency to every LLM call.
+
+### Why BullMQ over a simple setTimeout / setImmediate
+Ingestion and eval jobs need to survive gateway restarts. A `setTimeout` inside the
+request handler dies when the process dies. BullMQ persists jobs in Redis, supports
+retries with backoff, and provides a job lifecycle (waiting → active → completed/failed)
+that can be monitored. This is the production-correct choice for any async work that
+must not be silently dropped.
+
+### Why Postgres for everything (not a dedicated vector DB)
+Using pgvector keeps the stack to one database. A dedicated vector DB (Pinecone, Qdrant,
+Weaviate) adds an external dependency, a separate connection, and a separate backup
+strategy. pgvector with an IVFFlat index is fast enough for hundreds of thousands of
+chunks, which covers every realistic scale for this project. The `<=>` cosine distance
+operator integrates directly into SQL, which means retrieval, filtering, and joins
+(e.g., joining chunks to documents to tenants) are one query instead of two round trips.
+
+### Why SHA-256 for API key hashing (not bcrypt)
+API keys are long random strings with high entropy. bcrypt is designed for low-entropy
+secrets (passwords) and adds deliberate slowness to resist brute force. For a 32-byte
+random key, SHA-256 is sufficient and fast. The raw key is shown once at creation time
+and never stored — only the hash is persisted. This is the same approach used by GitHub
+and Stripe for API tokens.
+
+### Why semantic cache is skipped for sessions
+If a user is in a multi-turn session, their messages carry conversational context that
+makes them non-equivalent to a similar message from a different session. "What about
+the second point?" means something completely different depending on what was said
+before. Returning a cached response for a context-dependent message would be wrong.
+The session_id check in `chat.ts` guards this correctly.
+
+### Why the context guard summarizes at 75% of the model limit, not 100%
+At 100% the next request will already fail with a context length error. At 75% there
+is still room for the incoming user message, the summary system prompt, and the model's
+response. The 25% headroom prevents the edge case where a long assistant reply at 74%
+usage pushes the next request over the limit.
+
+### Why the eval worker scores responses asynchronously
+Eval scoring requires an LLM call (a judge model). Running it inline would add 500ms-2s
+to every response. The client does not need the eval score to use the response. The
+correct design is: send the response, then enqueue the eval. If the eval worker crashes
+or is slow, clients are never affected. This is the fire-and-forget pattern applied
+deliberately.
+
+### Why spans are flushed fire-and-forget (`flushSpans` without await)
+The same reasoning as eval: trace data is observability infrastructure. A failure in
+span persistence should never cause a client request to fail or slow down. The spans
+go into Postgres eventually; if they are lost in a rare crash, the `llm_requests` row
+still has the essential data (provider, model, tokens, cost, latency, status).
+
+### Why A/B experiments only apply when the caller does not pin a provider/model
+If a client explicitly says `"provider": "anthropic"`, they have opted out of routing
+decisions. Overriding that with an A/B experiment would violate the caller's intent
+and produce confusing results (they asked for Anthropic, they got Groq). The guard
+`if (!provider && !model)` in `chat.ts` respects caller intent.
+
+
+---
+
+## Challenges Faced & How They Were Solved
+
+### 1. Groq decommissioned llama3-8b-8192 mid-development
+
+**What happened:**
+The summarization step in `conversationMemory.ts` used `llama3-8b-8192` as a cheap,
+fast model for compressing old conversation turns. An active A/B experiment also had
+this model as its variant. Groq removed it from their API while the project was live.
+
+**Symptom:**
+Turn 2 of any multi-turn session returned HTTP 400 with:
+`"The model llama3-8b-8192 has been decommissioned and is no longer supported."`
+The gateway logged this, attempted fallback (which also failed because the fallback
+hit the same model through a different path), and returned an error to the client.
+Session save never fired, so turn 1 context was not available for turn 3.
+
+**Fix:**
+- Replaced `llama3-8b-8192` with `llama-3.1-8b-instant` in `conversationMemory.ts`
+- Updated the CONTEXT_LIMITS map to remove decommissioned models and add current ones
+- Updated the live A/B experiment row in Postgres directly via psql:
+  `UPDATE ab_experiments SET variant_model = 'llama-3.1-8b-instant' WHERE variant_model = 'llama3-8b-8192'`
+- Rebuilt and redeployed the gateway container
+
+**Lesson:**
+Model names are not stable. Any hardcoded model string is a potential production break.
+The right long-term fix is a config table of available models that can be updated
+without a redeploy, and an alert if any provider returns a `model_decommissioned` error.
+
+
+### 2. TypeScript compilation failed due to stray files in the wrong directory
+
+**What happened:**
+During a manual `scp` sync to the droplet, `chat.ts` and `app.ts` were accidentally
+copied to `/services/gateway/src/` instead of their correct subdirectories
+(`/services/gateway/src/routes/chat.ts` and `/services/gateway/src/app.ts`).
+The TypeScript compiler found two copies of each file. The stray copies had relative
+imports that pointed to non-existent paths from the wrong directory.
+
+**Symptom:**
+Docker build failed with a cascade of `Cannot find module` errors for every import in
+the codebase. Not just the stray files — tsc stopped being able to resolve any module
+because `rootDir` was violated.
+
+**Diagnosis:**
+SSH'd into the droplet, listed `/services/gateway/src/` directly, and found `chat.ts`
+and `app.ts` sitting at the wrong level. Identified them as the stray files by comparing
+their import paths against the tsconfig `rootDir`.
+
+**Fix:**
+```bash
+rm /opt/sentinelai/SentinelAI/services/gateway/src/chat.ts
+rm /opt/sentinelai/SentinelAI/services/gateway/src/app.ts
+# app.ts was also accidentally deleted from the correct path during cleanup
+# re-scp'd app.ts to the correct location
+scp app.ts root@droplet:/opt/sentinelai/SentinelAI/services/gateway/src/app.ts
+```
+Rebuild then succeeded cleanly.
+
+**Lesson:**
+Manual `scp` is error-prone for multi-directory syncs. The GitHub Actions deploy
+workflow (`rsync` or `docker compose build` on the droplet directly) is safer because
+it uses the repo's directory structure as the source of truth. Never use bare `scp`
+for anything other than a single file to a known path.
+
+
+### 3. PostgreSQL `ON CONFLICT DO NOTHING` failed without a conflict target
+
+**What happened:**
+The eval worker inserted into `eval_results` using `ON CONFLICT DO NOTHING` — a valid
+syntax in some databases, but PostgreSQL requires an explicit conflict target:
+`ON CONFLICT (column_name) DO NOTHING`.
+
+**Symptom:**
+The eval worker crashed on every job with:
+`ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification`
+Eval scores were never written to the database. The table existed and had a primary key,
+but PostgreSQL will not infer the conflict column — you must name it.
+
+**Fix:**
+Two changes were needed together:
+1. Add `UNIQUE` constraint to the `eval_results` table:
+   `ALTER TABLE eval_results ADD CONSTRAINT eval_results_request_id_key UNIQUE (request_id)`
+2. Change the query from `ON CONFLICT DO NOTHING` to `ON CONFLICT (request_id) DO NOTHING`
+
+The `init.sql` schema was also updated so fresh deployments have the constraint from
+the start. The live DB was patched via `docker exec ... psql -c "ALTER TABLE ..."`.
+
+**Lesson:**
+PostgreSQL's upsert syntax is stricter than MySQL's `INSERT IGNORE`. Always specify
+the conflict target column. Any `ON CONFLICT DO NOTHING` without a column name in
+Postgres is a latent crash waiting to happen.
+
+
+### 4. The `gemini` provider existed in the type but had no implementation
+
+**What happened:**
+The shared `Provider` type included `'gemini'` as a valid value. No case for `'gemini'`
+existed in the LLM service switch statement. If a client sent `"provider": "gemini"`,
+the switch fell through to a TypeScript `never` branch that threw an unhandled runtime
+error.
+
+**Symptom:**
+Any request with `provider: "gemini"` crashed the gateway process (unhandled rejection).
+No 400 was returned — the connection just dropped.
+
+**Fix:**
+Removed `'gemini'` from the `Provider` union type in `shared/src/types.ts`. The Zod
+schema in the chat route uses `z.enum(PROVIDERS)`, which now correctly rejects `gemini`
+at the validation layer with a proper 400 response before any LLM code runs.
+
+**Lesson:**
+Types and runtime validations must stay in sync. A union type that includes a value with
+no implementation is a lie to the compiler. The fix is either implement it or remove it
+from the type — never leave a dead branch in a switch on an exhaustive union.
+
+
+### 5. The agent calculator regex matched unsafe expressions
+
+**What happened:**
+The agent runtime had a calculator tool that evaluated math expressions. The safety
+check used a character class regex `[Math.sqrt|pow|abs...]` to allow Math functions.
+A character class `[...]` matches any single character in the set — it does not match
+the string `Math.sqrt`. The pipe `|` inside a character class is a literal pipe character,
+not alternation. So the regex allowed the pipe character and the letters M, a, t, h, etc.
+individually, which meant expressions like `Math.random()` (dangerous — calls a function)
+and `process.exit(1)` (catastrophic) could pass the check.
+
+**Symptom:**
+The calculator would accept and evaluate arbitrary JavaScript if the characters happened
+to be in the character class. Not immediately exploitable in the demo, but a security
+hole that would be obvious to any reviewer.
+
+**Fix:**
+Changed the approach: first strip known-safe Math functions using `.replace()` with a
+proper alternation regex, then validate that what remains contains only digits,
+operators, whitespace, and parentheses:
+
+```typescript
+const safe = expression
+  .replace(/Math\.(sqrt|pow|abs|ceil|floor|round|min|max|log|PI)\b/g, '0')
+  .replace(/\d+(\.\d+)?/g, '0');
+const allowed = /^[\d\s\+\-\*\/%\(\)\.]+$/.test(safe);
+```
+
+This strips the allowed Math calls first, then checks the remainder contains nothing
+executable.
+
+**Lesson:**
+Character classes `[...]` and alternation groups `(a|b|c)` are completely different
+regex constructs. Security-critical regex should be tested against adversarial inputs
+before deployment, not just happy-path examples.
+
+
+### 6. Multi-turn session context appeared broken (was actually a model failure)
+
+**What happened:**
+During end-to-end testing of conversation memory, turn 2 returned:
+"I don't have any information about your preferences."
+The session table showed `turn_count: 2, messages: 2` — only 2 messages after 2 turns,
+when there should have been 4 (user1, asst1, user2, asst2).
+
+**Initial hypothesis:**
+The `loadSession` function was not loading the history correctly, or `saveSession` was
+only storing the new turn.
+
+**Actual cause:**
+The A/B experiment was routing turn 2 to `llama3-8b-8192` (which was decommissioned —
+see challenge #1). The LLM call returned 400. The gateway caught this as an error and
+returned it to the client. Because the LLM call failed, `saveSession` never executed.
+So turn 2's history was never written, turn_count was incremented by the failed
+session insert's conflict handling, and the next check saw 2 messages (just turn 1).
+
+**How it was debugged:**
+Checked gateway logs via `docker compose logs gateway --tail=20`. Saw the exact error:
+`model_decommissioned` for `llama3-8b-8192`. Then confirmed session logic was correct
+by pinning `provider: groq, model: llama-3.3-70b-versatile` in the test curl — context
+was retained perfectly. The fix was the same as challenge #1.
+
+**Lesson:**
+When a stateful feature (session memory) appears broken, check whether the underlying
+operation (LLM call) actually succeeded before debugging the state management logic.
+Correlation via trace_id or request logs saves hours of wrong-direction debugging.
+
+
+### 7. DB schema changes on a live database (init.sql only runs once)
+
+**What happened:**
+PostgreSQL's Docker image runs `init.sql` only on the very first container start — when
+the data directory is empty. Adding new tables or columns to `init.sql` does not apply
+them to an existing running database. After adding `semantic_cache`, `tenant_budgets`,
+`ab_experiments`, `conversation_sessions`, and the `content_tsv` generated column to
+`init.sql`, the running Postgres container on the droplet had none of them.
+
+**What we tried first (failed):**
+Tried to run multiple SQL statements via a bash heredoc over SSH:
+```bash
+ssh root@droplet "docker exec postgres psql -U sentinel -d sentinelai << 'EOF'
+CREATE TABLE ...;
+EOF"
+```
+The heredoc was not passed correctly through the SSH/shell quoting layers and executed
+nothing silently (exit 0, no output, no tables created).
+
+**Fix:**
+Ran each DDL statement as a separate `-c` argument to psql:
+```bash
+docker exec sentinelai-postgres-1 psql -U sentinel -d sentinelai \
+  -c "CREATE TABLE IF NOT EXISTS semantic_cache (...)"
+docker exec sentinelai-postgres-1 psql -U sentinel -d sentinelai \
+  -c "ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS content_tsv tsvector ..."
+```
+Each statement confirmed with `CREATE TABLE` or `ALTER TABLE` output.
+
+**Lesson:**
+For a production system, the right approach is a migration tool (Flyway, Liquibase,
+golang-migrate) that tracks which migrations have run and applies only new ones. For a
+portfolio project, running explicit `-c` statements per change works but requires careful
+tracking of what has been applied to the live DB vs what is in `init.sql`.
+
+
+### 8. SSH heredoc quoting with JSON payloads in curl commands
+
+**What happened:**
+Testing multi-turn sessions required sending curl commands over SSH that included JSON
+bodies with variable substitution (the session UUID). Bash variable expansion inside
+SSH remote commands, inside JSON strings, inside heredocs produced broken quoting:
+
+```bash
+# This breaks — $SESSION_ID does not expand inside single quotes
+ssh root@droplet 'SESSION_ID=... && curl ... -d "{"session_id":"$SESSION_ID"}"'
+```
+
+**Fix:**
+Two approaches that work:
+1. Use the `uuidgen` command on the remote host and pass the whole script as a single-quoted
+   SSH argument, using `$(uuidgen)` to generate the UUID on the remote side.
+2. Wrap complex multi-step tests in a Python one-liner on the remote host to avoid shell
+   quoting entirely.
+
+For the actual test that confirmed session memory:
+```bash
+ssh root@droplet 'SESSION_ID=$(uuidgen)
+RESP=$(curl -s -X POST http://localhost:3000/v1/chat \
+  -H "X-Api-Key: sentinel-dev-key" \
+  -H "Content-Type: application/json" \
+  -d "{\"messages\":[...],\"session_id\":\"$SESSION_ID\"}")
+echo "$RESP" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get(\"content\"))"'
+```
+
+**Lesson:**
+Never interpolate variables into JSON strings inside SSH remote commands using shell
+string concatenation. Either generate the value on the remote host, or use Python/jq
+to build the JSON payload.
+
+
+---
 
 ## Architecture
 
@@ -65,7 +497,7 @@ infra/
   nginx/nginx.conf         — Reverse proxy
   prometheus/              — Metrics scrape config + alert rules
   grafana/                 — Dashboard provisioning
-docker-compose.yml         — Full local stack
+docker-compose.yml         — Full local stack (8 services)
 ```
 
 Request path for POST /v1/chat:
@@ -163,16 +595,20 @@ auth plugin (SHA-256 key lookup)
 
 ## Database schema (key tables)
 
-- tenants, api_keys — multi-tenant auth
-- llm_requests — one row per request, full audit trail
-- trace_spans — OTel-style spans linked by trace_id
-- document_chunks — chunked text + vector(1024) + tsvector for hybrid search
-- eval_results — per-request quality scores
-- audit_logs — append-only, no UPDATE/DELETE
-- conversation_sessions — server-side message history + summary
-- semantic_cache — query embedding + response, TTL-based
-- tenant_budgets — monthly spend limits
-- ab_experiments — A/B routing experiment config
+| Table                   | Purpose                                                      |
+|-------------------------|--------------------------------------------------------------|
+| tenants, api_keys       | Multi-tenant auth, scopes, rate limits                       |
+| llm_requests            | One row per request — full audit trail                       |
+| trace_spans             | OTel-style spans linked by trace_id                          |
+| document_chunks         | Chunked text + vector(1024) + tsvector for hybrid search     |
+| retrieval_results       | What was retrieved per RAG request (for eval)                |
+| eval_results            | Per-request faithfulness/relevance/coherence scores          |
+| audit_logs              | Append-only compliance log (no UPDATE/DELETE allowed)        |
+| conversation_sessions   | Server-side message history + compressed summary             |
+| semantic_cache          | Query embedding + response text, TTL-based                   |
+| tenant_budgets          | Monthly spend limits + alert thresholds                      |
+| ab_experiments          | A/B routing experiment config and traffic split              |
+| metrics_daily           | Pre-aggregated daily rollups for dashboard queries           |
 
 
 ## Deployment
@@ -181,11 +617,15 @@ Live on DigitalOcean droplet (64.227.178.3), port 3000 behind Nginx.
 All 8 containers running: gateway, ingestion-worker, eval-worker, postgres,
 redis, nginx, prometheus, grafana.
 
-GitHub Actions pipeline on push to main: SSH to droplet, docker compose build,
-rolling restart with health check.
+GitHub Actions pipeline on push to main:
+- SSH to droplet
+- docker compose build (only changed services rebuild)
+- Rolling restart with health check loop (15 retries, dumps logs on failure)
 
 
-## Resume bullets
+---
+
+## Resume Bullets
 
 - Built a self-hosted AI gateway handling multi-provider LLM routing, prompt guardrails,
   PII redaction, and cost budget enforcement across multiple tenants with SHA-256 hashed
@@ -204,29 +644,52 @@ rolling restart with health check.
   exponential backoff retries, and append-only audit logs.
 
 
-## Interview talking points
+---
 
-- Why a gateway instead of direct API calls?
-  Centralizes auth, rate limiting, cost tracking, guardrails, and observability. Every
-  app gets these for free without implementing them individually.
+## Interview Talking Points
 
-- How does the semantic cache work?
-  Each query is embedded via Mistral. On new requests, we run a cosine similarity query
-  in pgvector against cached embeddings. If the nearest match exceeds 0.95, we return
-  the cached response without calling the LLM. TTL is 24 hours.
+**Why a gateway instead of direct API calls?**
+Centralizes auth, rate limiting, cost tracking, guardrails, and observability. Every
+app gets these for free without implementing them individually. Without a gateway, every
+team builds their own retry logic, their own logging, their own key rotation — all of
+it slightly different, all of it untested. The gateway makes that undifferentiated work
+a solved problem.
 
-- How does hybrid search differ from pure vector search?
-  Vector search finds semantically similar chunks but misses exact keyword matches.
-  Full-text search (tsvector) is precise for exact terms but blind to semantics.
-  Reciprocal Rank Fusion merges both ranked lists: score = sum(1 / (60 + rank))
-  across both result sets, giving documents a boost if they rank well in either.
+**How does the semantic cache work?**
+Each query is embedded via Mistral. On new requests, we run a cosine similarity query
+in pgvector against cached embeddings. If the nearest match exceeds 0.95, we return
+the cached response without calling the LLM. TTL is 24 hours. The 0.95 threshold is
+tight — "what is the capital of France?" and "what is France's capital?" will hit the
+same cache entry, but "what is the capital of France today?" versus "what was the
+capital of France in 1800?" will not.
 
-- How does the context guard work?
-  When a session exceeds 75% of the model's token limit, we take all turns except the
-  last 4, summarize them into 2-4 sentences using a fast cheap model (llama-3.1-8b-instant),
-  then store only the summary + fresh turns. The summary is injected as a system message.
+**How does hybrid search differ from pure vector search?**
+Vector search finds semantically similar chunks but misses exact keyword matches.
+Full-text search (tsvector) is precise for exact terms but blind to semantics.
+Reciprocal Rank Fusion merges both ranked lists: score = sum(1 / (60 + rank))
+across both result sets. A document that ranks #2 in vector search and #3 in keyword
+search beats a document that ranks #1 in only one. The k=60 constant smooths out the
+difference between rank 1 and rank 10 in shallow result sets.
 
-- What happens if the primary LLM fails?
-  withRetry() wraps every provider call: 3 attempts with exponential backoff (100ms,
-  200ms, 400ms ± 50ms jitter). If all retries fail, getFallbackRoute() picks a secondary
-  provider/model and retries once more.
+**How does the context guard work?**
+When a session's total token estimate exceeds 75% of the model's context limit, we take
+all turns except the last 4 and send them to a fast cheap model (llama-3.1-8b-instant)
+with the prompt: "Summarize these conversation turns into 2-4 sentences, preserving
+key facts." The summary replaces those turns and is stored in the sessions table. On
+the next request, the summary is injected as a system message before the fresh turns.
+The 75% threshold leaves room for the incoming message and the model's response.
+
+**What happens if the primary LLM fails?**
+`withRetry()` wraps every provider call: 3 attempts with exponential backoff (100ms,
+200ms, 400ms ± 50ms jitter). If all retries fail, `getFallbackRoute()` picks a
+secondary provider/model and retries once more. If that also fails, the error propagates
+and the request returns a 400. Every failure attempt is logged with the provider error
+so the trace shows exactly which model failed and why.
+
+**What was the hardest bug to debug?**
+The session memory appearing broken when it was actually a model decommission. Turn 2
+was failing silently because the A/B experiment routed it to a decommissioned Groq model.
+The session save never executed because the LLM call 400'd first. The fix was two lines
+of code, but finding it required reading the gateway logs and correlating the error to
+the A/B routing decision — which is exactly what the trace spans and audit logs are
+designed to make possible.
