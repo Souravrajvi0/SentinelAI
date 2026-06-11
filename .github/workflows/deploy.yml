@@ -16,26 +16,27 @@ jobs:
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DROPLET_IP }}
-          username: root
+          username: ${{ secrets.DROPLET_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          command_timeout: 10m
           script: |
             set -e
             cd /opt/sentinelai/SentinelAI
 
-            # Pull latest code
+            # Pull latest code from GitHub
             git fetch origin main
             git reset --hard origin/main
 
-            # Rebuild and restart services (zero-downtime where possible)
-            docker compose pull --ignore-pull-failures || true
+            # Rebuild only changed service images, restart in place
             docker compose up -d --build --remove-orphans
 
-            # Wait for gateway health — fail deploy if not up within 45s
-            echo "Waiting for gateway..."
+            # Wait for gateway to become healthy (45s max)
+            echo "Waiting for gateway health..."
             healthy=0
             for i in $(seq 1 15); do
-              if curl -sf http://localhost:3000/health > /dev/null; then
-                echo "Gateway healthy after ${i} attempts"
+              if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
+                echo "Gateway healthy after $((i * 3))s"
                 healthy=1
                 break
               fi
@@ -43,10 +44,10 @@ jobs:
             done
 
             if [ "$healthy" -eq 0 ]; then
-              echo "ERROR: Gateway did not become healthy"
+              echo "ERROR: Gateway did not become healthy after 45s"
               docker compose logs gateway --tail=50
               exit 1
             fi
 
-            # Print final status
+            # Show running containers
             docker compose ps
