@@ -1,0 +1,52 @@
+name: Deploy to DigitalOcean
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to droplet via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DROPLET_IP }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd /opt/sentinelai/SentinelAI
+
+            # Pull latest code
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Rebuild and restart services (zero-downtime where possible)
+            docker compose pull --ignore-pull-failures || true
+            docker compose up -d --build --remove-orphans
+
+            # Wait for gateway health — fail deploy if not up within 45s
+            echo "Waiting for gateway..."
+            healthy=0
+            for i in $(seq 1 15); do
+              if curl -sf http://localhost:3000/health > /dev/null; then
+                echo "Gateway healthy after ${i} attempts"
+                healthy=1
+                break
+              fi
+              sleep 3
+            done
+
+            if [ "$healthy" -eq 0 ]; then
+              echo "ERROR: Gateway did not become healthy"
+              docker compose logs gateway --tail=50
+              exit 1
+            fi
+
+            # Print final status
+            docker compose ps

@@ -1,0 +1,21 @@
+{
+  "name": "sentinelai",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "shared",
+    "services/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspaces --if-present",
+    "build": "npm run build --workspaces --if-present",
+    "lint": "eslint 'services/*/src/**/*.ts' 'shared/src/**/*.ts'",
+    "typecheck": "tsc --build"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.5"
+  }
+}

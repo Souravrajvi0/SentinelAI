@@ -1,0 +1,40 @@
+groups:
+  - name: sentinelai
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          rate(llm_requests_total{status="error"}[5m])
+          / rate(llm_requests_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM error rate above 10%"
+          description: "Provider {{ $labels.provider }} model {{ $labels.model }} error rate is {{ $value | humanizePercentage }}"
+
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, rate(llm_latency_seconds_bucket[5m])) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 LLM latency above 10s"
+          description: "Provider {{ $labels.provider }} p95 latency is {{ $value | humanizeDuration }}"
+
+      - alert: HighGuardrailTriggerRate
+        expr: rate(guardrails_triggered_total[10m]) > 0.5
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Elevated guardrail trigger rate"
+          description: "Guardrail action={{ $labels.action }} reason={{ $labels.reason }} firing at {{ $value }}/s"
+
+      - alert: GatewayDown
+        expr: up{job="sentinelai-gateway"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SentinelAI gateway is down"
+          description: "The gateway has been unreachable for more than 1 minute"
