@@ -23,7 +23,7 @@ import {
   guardrailsTriggeredTotal,
 } from '../services/metricsRegistry';
 
-const PROVIDERS = ['openai', 'anthropic', 'groq', 'mistral', 'cerebras'] as const;
+const PROVIDERS = ['openai', 'anthropic', 'groq', 'mistral', 'cerebras', 'gemini'] as const;
 
 const bodySchema = z.object({
   messages: z.array(z.object({

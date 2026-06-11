@@ -20,8 +20,11 @@ function openaiCompatClient(provider: ExtendedProvider): OpenAI {
     case 'cerebras':
       if (!config.CEREBRAS_API_KEY) throw new Error('CEREBRAS_API_KEY not set');
       return new OpenAI({ apiKey: config.CEREBRAS_API_KEY, baseURL: 'https://api.cerebras.ai/v1' });
+    case 'gemini':
+      if (!config.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY not set');
+      return new OpenAI({ apiKey: config.GEMINI_API_KEY, baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/' });
     default:
-      throw new Error(`Use anthropicClient() for provider: ${provider}`);
+      throw new Error(`Unknown provider: ${provider}`);
   }
 }
 
@@ -113,13 +116,15 @@ export async function callLLM(
 
 // Cost per 1M tokens (prompt / completion) — free tier providers show $0
 const COST_TABLE: Record<string, [number, number]> = {
-  'llama-3.3-70b-versatile': [0, 0],
-  'llama3-8b-8192':          [0, 0],
-  'llama3-70b-8192':         [0, 0],
-  'mistral-large-latest':    [2.00, 6.00],
-  'mistral-small-latest':    [0.10, 0.30],
+  'llama-3.3-70b-versatile':    [0, 0],
+  'llama-3.1-8b-instant':       [0, 0],
+  'mistral-large-latest':       [2.00, 6.00],
+  'mistral-small-latest':       [0.10, 0.30],
   'claude-3-5-sonnet-20241022': [3.00, 15.00],
   'claude-haiku-4-5-20251001':  [0.25, 1.25],
+  'gemini-2.0-flash':           [0.10, 0.40],
+  'gemini-1.5-flash':           [0.075, 0.30],
+  'gemini-1.5-pro':             [1.25, 5.00],
 };
 
 export function estimateCost(model: string, promptTokens: number, completionTokens: number): number {

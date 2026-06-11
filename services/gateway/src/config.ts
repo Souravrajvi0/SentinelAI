@@ -19,10 +19,11 @@ const schema = z.object({
   MISTRAL_API_KEY: z.string().optional(),
   CEREBRAS_API_KEY: z.string().optional(),
   ANTHROPIC_API_KEY: z.string().optional(),
+  GEMINI_API_KEY: z.string().optional(),
 
-  DEFAULT_PROVIDER: z.enum(['openai', 'anthropic', 'groq', 'mistral', 'cerebras']).default('groq'),
+  DEFAULT_PROVIDER: z.enum(['openai', 'anthropic', 'groq', 'mistral', 'cerebras', 'gemini']).default('groq'),
   DEFAULT_MODEL: z.string().default('llama-3.3-70b-versatile'),
-  FALLBACK_PROVIDER: z.enum(['openai', 'anthropic', 'groq', 'mistral', 'cerebras']).optional(),
+  FALLBACK_PROVIDER: z.enum(['openai', 'anthropic', 'groq', 'mistral', 'cerebras', 'gemini']).optional(),
   FALLBACK_MODEL: z.string().optional(),
 
   MISTRAL_EMBEDDING_MODEL: z.string().default('mistral-embed'),
